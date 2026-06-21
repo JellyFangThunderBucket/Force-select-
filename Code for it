@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Force Select+
-// @version      2.0.0
-// @description  Modern text-selection unlocker: restores selection, copy, context menus, drag, and common keyboard shortcuts on hostile websites.
+// @version      2.1.0
+// @description  Absolute-mode text-selection unlocker: restores selection, right-click, clipboard events, drag, pointer actions, and optional auto-copy on hostile websites.
 // @author       You
 // @match        *://*/*
 // @run-at       document-start
@@ -16,7 +16,10 @@
 
   const SCRIPT_NAME = 'Force Select+';
   const STYLE_ID = 'force-select-plus-style';
-  const HOST_ATTR = 'data-force-select-plus';
+  const AUTO_COPY_STORAGE_KEY = 'forceSelectPlusAutoCopy';
+  const guardedRoots = new WeakSet();
+  const observedRoots = new WeakSet();
+  const protectedEvents = new WeakSet();
   const BLOCKED_EVENTS = [
     'selectstart',
     'selectionchange',
@@ -29,6 +32,10 @@
     'mouseup',
     'keydown',
     'keyup',
+    'pointerdown',
+    'pointerup',
+    'touchstart',
+    'touchend',
   ];
   const SELECTOR = [
     'html',
@@ -45,14 +52,15 @@
   ].join(',');
 
   const CSS = `
-    html, body, body *:not(input):not(textarea):not(select):not(option),
-    ::before, ::after {
+    *, *::before, *::after,
+    html, body, body *:not(input):not(textarea):not(select):not(option) {
       -webkit-touch-callout: default !important;
       -webkit-user-drag: auto !important;
       -webkit-user-select: text !important;
       -moz-user-select: text !important;
       -ms-user-select: text !important;
       user-select: text !important;
+      pointer-events: auto !important;
       cursor: auto !important;
     }
 
@@ -70,7 +78,7 @@
     }
   `;
 
-  const handledRoots = new WeakSet();
+  const originalPreventDefault = Event.prototype.preventDefault;
   let toastTimer;
 
   const ready = (callback) => {
@@ -83,7 +91,7 @@
   };
 
   const ensureStyle = (root = document) => {
-    if (!root || handledRoots.has(root)) return;
+    if (!root || root.getElementById?.(STYLE_ID)) return;
 
     const ownerDocument = root.ownerDocument || document;
     const style = ownerDocument.createElement('style');
@@ -92,7 +100,7 @@
 
     const target = root.head || root.documentElement || root;
     target.appendChild(style);
-    handledRoots.add(root);
+
   };
 
   const cleanElement = (element) => {
@@ -127,7 +135,7 @@
     });
   };
 
-  const allowUserAction = (event) => {
+  const shouldProtectEvent = (event) => {
     const key = event.key?.toLowerCase();
     const isUsefulShortcut =
       event.type === 'keydown' &&
@@ -136,27 +144,29 @@
 
     const isSelectionEvent = ['selectstart', 'selectionchange', 'copy', 'cut', 'paste', 'contextmenu', 'dragstart'].includes(event.type);
 
-    if (!isUsefulShortcut && !isSelectionEvent) return;
+    return isUsefulShortcut || isSelectionEvent;
+  };
 
+  const allowUserAction = (event) => {
+    if (!shouldProtectEvent(event)) return;
+
+    protectedEvents.add(event);
     event.stopImmediatePropagation();
   };
 
   const installEventGuards = (root = document) => {
-    if (!root || root[HOST_ATTR]) return;
+    if (!root || guardedRoots.has(root)) return;
 
     BLOCKED_EVENTS.forEach((eventName) => {
-      root.addEventListener(eventName, allowUserAction, true);
+      root.addEventListener(eventName, allowUserAction, { capture: true, passive: false });
     });
 
-    Object.defineProperty(root, HOST_ATTR, {
-      value: true,
-      configurable: false,
-    });
+    guardedRoots.add(root);
   };
 
   const observe = (root = document) => {
     const target = root.documentElement || root.body || root;
-    if (!target || target.forceSelectPlusObserver) return;
+    if (!target || observedRoots.has(target)) return;
 
     const observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
@@ -180,10 +190,7 @@
       attributeFilter: ['style', 'class', 'unselectable', 'onselectstart', 'oncopy', 'oncontextmenu', 'ondragstart'],
     });
 
-    Object.defineProperty(target, 'forceSelectPlusObserver', {
-      value: observer,
-      configurable: true,
-    });
+    observedRoots.add(target);
   };
 
   const unlockRoot = (root = document) => {
@@ -193,12 +200,65 @@
     observe(root);
   };
 
-  const showToast = () => {
+  const patchPreventDefault = () => {
+    if (Event.prototype.preventDefault.forceSelectPlusPatched) return;
+
+    Event.prototype.preventDefault = function forceSelectPlusPreventDefault() {
+      if (protectedEvents.has(this) || shouldProtectEvent(this)) {
+        protectedEvents.add(this);
+        return undefined;
+      }
+
+      return originalPreventDefault.call(this);
+    };
+
+    Object.defineProperty(Event.prototype.preventDefault, 'forceSelectPlusPatched', {
+      value: true,
+      configurable: false,
+    });
+  };
+
+  const getAutoCopySetting = () => {
+    try {
+      return localStorage.getItem(AUTO_COPY_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  };
+
+  const setAutoCopySetting = (enabled) => {
+    try {
+      localStorage.setItem(AUTO_COPY_STORAGE_KEY, String(Boolean(enabled)));
+      showToast(`Auto-copy ${enabled ? 'enabled' : 'disabled'}`);
+    } catch {
+      showToast('Auto-copy unavailable');
+    }
+  };
+
+  const autoCopySelection = async () => {
+    if (!getAutoCopySetting() || !navigator.clipboard?.writeText) return;
+
+    const selectedText = window.getSelection?.().toString().trim();
+    if (!selectedText) return;
+
+    await navigator.clipboard.writeText(selectedText);
+    showToast('Selection copied');
+  };
+
+  const installAutoCopy = () => {
+    window.addEventListener('mouseup', () => {
+      window.setTimeout(() => {
+        autoCopySelection().catch(() => undefined);
+      }, 0);
+    }, { capture: true, passive: true });
+  };
+
+  const showToast = (message = `${SCRIPT_NAME} enabled`) => {
     if (!document.body || document.getElementById('force-select-plus-toast')) return;
 
     const toast = document.createElement('div');
     toast.id = 'force-select-plus-toast';
-    toast.textContent = `${SCRIPT_NAME} enabled`;
+    toast.textContent = message;
     toast.style.cssText = `
       position: fixed;
       right: 16px;
@@ -232,6 +292,15 @@
     }, 1800);
   };
 
+  const exposeUtilityApi = () => {
+    window.ForceSelectPlus = Object.freeze({
+      enableAutoCopy: () => setAutoCopySetting(true),
+      disableAutoCopy: () => setAutoCopySetting(false),
+      isAutoCopyEnabled: getAutoCopySetting,
+      unlock: () => unlockRoot(document),
+    });
+  };
+
   const patchAttachShadow = () => {
     if (!Element.prototype.attachShadow || Element.prototype.attachShadow.forceSelectPlusPatched) return;
 
@@ -249,7 +318,11 @@
   };
 
   ready(() => {
+    patchPreventDefault();
     patchAttachShadow();
+    installEventGuards(window);
+    installAutoCopy();
+    exposeUtilityApi();
     unlockRoot(document);
 
     if (document.readyState === 'loading') {
