@@ -1,20 +1,438 @@
 // ==UserScript==
-// @name         Force Select
-// @version      1.0
-// @description  Stop sites from disabling selection of text
+// @name         Force Select+
+// @version      2.2.0
+// @description  iOS-ready absolute-mode text-selection unlocker for selection, right-click, clipboard events, drag, touch, pointer actions, and optional auto-copy.
 // @author       You
 // @match        *://*/*
+// @include      http://*/*
+// @include      https://*/*
+// @run-at       document-start
 // @grant        none
-// @namespace https://greasyfork.org/users/1189174
-// @downloadURL https://update.greasyfork.org/scripts/476798/Force%20Select.user.js
-// @updateURL https://update.greasyfork.org/scripts/476798/Force%20Select.meta.js
+// @namespace    https://greasyfork.org/users/1189174
+// @downloadURL  https://update.greasyfork.org/scripts/476798/Force%20Select.user.js
+// @updateURL    https://update.greasyfork.org/scripts/476798/Force%20Select.meta.js
 // ==/UserScript==
 
-(function() {
+(() => {
   'use strict';
 
-  let style = document.createElement('style');
-  style.innerHTML = '*{ user-select: auto !important; }';
+  const SCRIPT_NAME = 'Force Select+';
+  const STYLE_ID = 'force-select-plus-style';
+  const TOAST_ID = 'force-select-plus-toast';
+  const AUTO_COPY_STORAGE_KEY = 'forceSelectPlusAutoCopy';
+  const BOOT_RETRY_LIMIT = 40;
+  const BOOT_RETRY_INTERVAL = 250;
+  const guardedRoots = new WeakSet();
+  const observedRoots = new WeakSet();
+  const protectedEvents = new WeakSet();
+  const originalPreventDefault = Event.prototype.preventDefault;
+  const originalAttachShadow = Element.prototype.attachShadow;
+  let bootRetries = 0;
+  let bootTimer;
+  let toastTimer;
 
-  document.body.appendChild(style);
+  const BLOCKED_EVENTS = [
+    'selectstart',
+    'selectionchange',
+    'beforecopy',
+    'copy',
+    'beforecut',
+    'cut',
+    'beforepaste',
+    'paste',
+    'contextmenu',
+    'dragstart',
+    'mousedown',
+    'mouseup',
+    'pointerdown',
+    'pointerup',
+    'touchstart',
+    'touchend',
+    'keydown',
+    'keyup',
+  ];
+
+  const PROTECTED_EVENT_TYPES = [
+    'selectstart',
+    'selectionchange',
+    'beforecopy',
+    'copy',
+    'beforecut',
+    'cut',
+    'beforepaste',
+    'paste',
+    'contextmenu',
+    'dragstart',
+  ];
+
+  const SELECTOR = [
+    'html',
+    'body',
+    '[style*="user-select"]',
+    '[style*="-webkit-user-select"]',
+    '[style*="-moz-user-select"]',
+    '[style*="-ms-user-select"]',
+    '[style*="pointer-events"]',
+    '[unselectable]',
+    '[onselectstart]',
+    '[oncopy]',
+    '[oncut]',
+    '[onpaste]',
+    '[oncontextmenu]',
+    '[ondragstart]',
+  ].join(',');
+
+  const CSS = `
+    *, *::before, *::after,
+    html, body, body *:not(input):not(textarea):not(select):not(option) {
+      -webkit-touch-callout: default !important;
+      -webkit-tap-highlight-color: rgba(56, 189, 248, 0.18) !important;
+      -webkit-user-drag: auto !important;
+      -webkit-user-select: text !important;
+      -khtml-user-select: text !important;
+      -moz-user-select: text !important;
+      -ms-user-select: text !important;
+      user-select: text !important;
+      pointer-events: auto !important;
+      cursor: auto !important;
+    }
+
+    input, textarea, select, option, [contenteditable=""], [contenteditable="true"], [role="textbox"] {
+      -webkit-touch-callout: default !important;
+      -webkit-user-select: text !important;
+      -khtml-user-select: text !important;
+      -moz-user-select: text !important;
+      -ms-user-select: text !important;
+      user-select: text !important;
+      pointer-events: auto !important;
+    }
+
+    ::selection {
+      background: rgba(56, 189, 248, 0.35) !important;
+      color: inherit !important;
+      text-shadow: none !important;
+    }
+  `;
+
+  const isElement = (node) => Boolean(node && node.nodeType === Node.ELEMENT_NODE);
+
+  const getExistingStyle = (root) => {
+    if (!root) return null;
+    if (typeof root.getElementById === 'function') return root.getElementById(STYLE_ID);
+    if (typeof root.querySelector === 'function') return root.querySelector(`#${STYLE_ID}`);
+    return null;
+  };
+
+  const getStyleTarget = (root) => {
+    if (root === document) return document.head || document.documentElement || document.body;
+    return root.head || root.documentElement || root;
+  };
+
+  const ensureStyle = (root = document) => {
+    const target = getStyleTarget(root);
+    if (!target) return;
+
+    const ownerDocument = root.ownerDocument || document;
+    let style = getExistingStyle(root);
+
+    if (!style) {
+      style = ownerDocument.createElement('style');
+      style.id = STYLE_ID;
+      style.type = 'text/css';
+      style.textContent = CSS;
+    } else if (style.textContent !== CSS) {
+      style.textContent = CSS;
+    }
+
+    if (style.parentNode !== target && typeof target.appendChild === 'function') {
+      target.appendChild(style);
+    }
+  };
+
+  const cleanElement = (element) => {
+    if (!isElement(element)) return;
+
+    element.removeAttribute('unselectable');
+    element.removeAttribute('onselectstart');
+    element.removeAttribute('oncopy');
+    element.removeAttribute('oncut');
+    element.removeAttribute('onpaste');
+    element.removeAttribute('oncontextmenu');
+    element.removeAttribute('ondragstart');
+
+    const style = element.style;
+    if (style) {
+      style.setProperty('user-select', 'text', 'important');
+      style.setProperty('-webkit-user-select', 'text', 'important');
+      style.setProperty('-khtml-user-select', 'text', 'important');
+      style.setProperty('-moz-user-select', 'text', 'important');
+      style.setProperty('-ms-user-select', 'text', 'important');
+      style.setProperty('pointer-events', 'auto', 'important');
+      style.setProperty('-webkit-touch-callout', 'default', 'important');
+    }
+
+    if (element.shadowRoot) unlockRoot(element.shadowRoot);
+  };
+
+  const cleanTree = (root = document) => {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+
+    root.querySelectorAll(SELECTOR).forEach(cleanElement);
+    root.querySelectorAll('*').forEach((element) => {
+      if (element.shadowRoot) unlockRoot(element.shadowRoot);
+    });
+  };
+
+  const isEditableTarget = (target) => {
+    if (!isElement(target)) return false;
+    const tagName = target.tagName ? target.tagName.toLowerCase() : '';
+    return target.isContentEditable || ['input', 'textarea', 'select', 'option'].includes(tagName) || target.getAttribute('role') === 'textbox';
+  };
+
+  const shouldProtectEvent = (event) => {
+    if (!event || !event.type) return false;
+
+    const key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+    const isUsefulShortcut =
+      event.type === 'keydown' &&
+      (event.ctrlKey || event.metaKey) &&
+      ['a', 'c', 'x', 'v', 's', 'p'].includes(key);
+
+    return isUsefulShortcut || PROTECTED_EVENT_TYPES.includes(event.type);
+  };
+
+  const allowUserAction = (event) => {
+    if (!shouldProtectEvent(event)) return;
+
+    protectedEvents.add(event);
+
+    if (!isEditableTarget(event.target) || event.type !== 'paste') {
+      event.stopImmediatePropagation();
+    }
+  };
+
+  const installEventGuards = (root = document) => {
+    if (!root || guardedRoots.has(root) || typeof root.addEventListener !== 'function') return;
+
+    BLOCKED_EVENTS.forEach((eventName) => {
+      root.addEventListener(eventName, allowUserAction, { capture: true, passive: false });
+    });
+
+    guardedRoots.add(root);
+  };
+
+  const observe = (root = document) => {
+    if (!root || typeof MutationObserver === 'undefined') return;
+
+    const target = root.documentElement || root.body || root;
+    if (!target || observedRoots.has(target) || typeof target.nodeType !== 'number') return;
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (isElement(node)) {
+            cleanElement(node);
+            cleanTree(node);
+          }
+        });
+
+        if (mutation.type === 'attributes' && isElement(mutation.target)) {
+          cleanElement(mutation.target);
+        }
+      });
+    });
+
+    observer.observe(target, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class', 'unselectable', 'onselectstart', 'oncopy', 'oncut', 'onpaste', 'oncontextmenu', 'ondragstart'],
+    });
+
+    observedRoots.add(target);
+  };
+
+  const unlockRoot = (root = document) => {
+    ensureStyle(root);
+    installEventGuards(root);
+    cleanTree(root);
+    observe(root);
+  };
+
+  const patchPreventDefault = () => {
+    if (Event.prototype.preventDefault.forceSelectPlusPatched) return;
+
+    Event.prototype.preventDefault = function forceSelectPlusPreventDefault() {
+      if (protectedEvents.has(this) || shouldProtectEvent(this)) {
+        protectedEvents.add(this);
+        return undefined;
+      }
+
+      return originalPreventDefault.call(this);
+    };
+
+    Object.defineProperty(Event.prototype.preventDefault, 'forceSelectPlusPatched', {
+      value: true,
+      configurable: false,
+    });
+  };
+
+  const getAutoCopySetting = () => {
+    try {
+      return localStorage.getItem(AUTO_COPY_STORAGE_KEY) === 'true';
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const setAutoCopySetting = (enabled) => {
+    try {
+      localStorage.setItem(AUTO_COPY_STORAGE_KEY, String(Boolean(enabled)));
+      showToast(`Auto-copy ${enabled ? 'enabled' : 'disabled'}`);
+    } catch (error) {
+      showToast('Auto-copy unavailable');
+    }
+  };
+
+  const writeClipboard = async (text) => {
+    if (!text) return false;
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    return copied;
+  };
+
+  const autoCopySelection = async () => {
+    if (!getAutoCopySetting()) return;
+
+    const selection = window.getSelection && window.getSelection();
+    const selectedText = selection ? selection.toString().trim() : '';
+    if (!selectedText) return;
+
+    const copied = await writeClipboard(selectedText);
+    if (copied) showToast('Selection copied');
+  };
+
+  const installAutoCopy = () => {
+    if (guardedRoots.has(installAutoCopy)) return;
+
+    window.addEventListener('mouseup', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    window.addEventListener('touchend', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    guardedRoots.add(installAutoCopy);
+  };
+
+  const showToast = (message = `${SCRIPT_NAME} enabled`) => {
+    const body = document.body || document.documentElement;
+    if (!body || document.getElementById(TOAST_ID)) return;
+
+    const toast = document.createElement('div');
+    toast.id = TOAST_ID;
+    toast.textContent = message;
+    toast.style.cssText = `
+      position: fixed;
+      right: max(16px, env(safe-area-inset-right));
+      bottom: max(16px, env(safe-area-inset-bottom));
+      z-index: 2147483647;
+      padding: 10px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.88);
+      color: #f8fafc;
+      font: 600 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      box-shadow: 0 16px 45px rgba(15, 23, 42, 0.28);
+      -webkit-backdrop-filter: blur(10px);
+      backdrop-filter: blur(10px);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 180ms ease, transform 180ms ease;
+    `;
+
+    body.appendChild(toast);
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+    });
+
+    clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(8px)';
+      window.setTimeout(() => toast.remove(), 220);
+    }, 1800);
+  };
+
+  const exposeUtilityApi = () => {
+    window.ForceSelectPlus = Object.freeze({
+      enableAutoCopy: () => setAutoCopySetting(true),
+      disableAutoCopy: () => setAutoCopySetting(false),
+      isAutoCopyEnabled: getAutoCopySetting,
+      unlock: () => unlockRoot(document),
+      version: '2.2.0',
+    });
+  };
+
+  const patchAttachShadow = () => {
+    if (!originalAttachShadow || Element.prototype.attachShadow.forceSelectPlusPatched) return;
+
+    Element.prototype.attachShadow = function patchedAttachShadow(init) {
+      const shadowRoot = originalAttachShadow.call(this, init);
+      unlockRoot(shadowRoot);
+      return shadowRoot;
+    };
+
+    Object.defineProperty(Element.prototype.attachShadow, 'forceSelectPlusPatched', {
+      value: true,
+      configurable: false,
+    });
+  };
+
+  const boot = () => {
+    patchPreventDefault();
+    patchAttachShadow();
+    installEventGuards(window);
+    installEventGuards(document);
+    installAutoCopy();
+    exposeUtilityApi();
+    unlockRoot(document);
+  };
+
+  const scheduleBootRetries = () => {
+    if (bootTimer) return;
+
+    bootTimer = window.setInterval(() => {
+      boot();
+      bootRetries += 1;
+
+      if (bootRetries >= BOOT_RETRY_LIMIT || document.readyState === 'complete') {
+        window.clearInterval(bootTimer);
+        bootTimer = null;
+      }
+    }, BOOT_RETRY_INTERVAL);
+  };
+
+  boot();
+  scheduleBootRetries();
+
+  document.addEventListener('DOMContentLoaded', () => {
+    boot();
+    showToast();
+  }, { once: true, capture: true });
+
+  window.addEventListener('load', boot, { once: true, capture: true });
+  window.addEventListener('pageshow', boot, { capture: true });
+  document.addEventListener('visibilitychange', boot, { capture: true });
+  window.addEventListener('focus', boot, { capture: true });
 })();
