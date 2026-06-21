@@ -1,20 +1,261 @@
 // ==UserScript==
-// @name         Force Select
-// @version      1.0
-// @description  Stop sites from disabling selection of text
+// @name         Force Select+
+// @version      2.0.0
+// @description  Modern text-selection unlocker: restores selection, copy, context menus, drag, and common keyboard shortcuts on hostile websites.
 // @author       You
 // @match        *://*/*
+// @run-at       document-start
 // @grant        none
-// @namespace https://greasyfork.org/users/1189174
-// @downloadURL https://update.greasyfork.org/scripts/476798/Force%20Select.user.js
-// @updateURL https://update.greasyfork.org/scripts/476798/Force%20Select.meta.js
+// @namespace    https://greasyfork.org/users/1189174
+// @downloadURL  https://update.greasyfork.org/scripts/476798/Force%20Select.user.js
+// @updateURL    https://update.greasyfork.org/scripts/476798/Force%20Select.meta.js
 // ==/UserScript==
 
-(function() {
+(() => {
   'use strict';
 
-  let style = document.createElement('style');
-  style.innerHTML = '*{ user-select: auto !important; }';
+  const SCRIPT_NAME = 'Force Select+';
+  const STYLE_ID = 'force-select-plus-style';
+  const HOST_ATTR = 'data-force-select-plus';
+  const BLOCKED_EVENTS = [
+    'selectstart',
+    'selectionchange',
+    'copy',
+    'cut',
+    'paste',
+    'contextmenu',
+    'dragstart',
+    'mousedown',
+    'mouseup',
+    'keydown',
+    'keyup',
+  ];
+  const SELECTOR = [
+    'html',
+    'body',
+    '[style*="user-select"]',
+    '[style*="-webkit-user-select"]',
+    '[style*="-moz-user-select"]',
+    '[style*="-ms-user-select"]',
+    '[unselectable]',
+    '[onselectstart]',
+    '[oncopy]',
+    '[oncontextmenu]',
+    '[ondragstart]',
+  ].join(',');
 
-  document.body.appendChild(style);
+  const CSS = `
+    html, body, body *:not(input):not(textarea):not(select):not(option),
+    ::before, ::after {
+      -webkit-touch-callout: default !important;
+      -webkit-user-drag: auto !important;
+      -webkit-user-select: text !important;
+      -moz-user-select: text !important;
+      -ms-user-select: text !important;
+      user-select: text !important;
+      cursor: auto !important;
+    }
+
+    input, textarea, select, option, [contenteditable=""], [contenteditable="true"] {
+      -webkit-user-select: text !important;
+      -moz-user-select: text !important;
+      -ms-user-select: text !important;
+      user-select: text !important;
+    }
+
+    ::selection {
+      background: rgba(56, 189, 248, 0.35) !important;
+      color: inherit !important;
+      text-shadow: none !important;
+    }
+  `;
+
+  const handledRoots = new WeakSet();
+  let toastTimer;
+
+  const ready = (callback) => {
+    if (document.documentElement) {
+      callback();
+      return;
+    }
+
+    document.addEventListener('readystatechange', callback, { once: true, capture: true });
+  };
+
+  const ensureStyle = (root = document) => {
+    if (!root || handledRoots.has(root)) return;
+
+    const ownerDocument = root.ownerDocument || document;
+    const style = ownerDocument.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = CSS;
+
+    const target = root.head || root.documentElement || root;
+    target.appendChild(style);
+    handledRoots.add(root);
+  };
+
+  const cleanElement = (element) => {
+    if (!(element instanceof Element)) return;
+
+    element.removeAttribute('unselectable');
+    element.removeAttribute('onselectstart');
+    element.removeAttribute('oncopy');
+    element.removeAttribute('oncut');
+    element.removeAttribute('oncontextmenu');
+    element.removeAttribute('ondragstart');
+
+    const style = element.style;
+    if (style) {
+      style.setProperty('user-select', 'text', 'important');
+      style.setProperty('-webkit-user-select', 'text', 'important');
+      style.setProperty('-moz-user-select', 'text', 'important');
+      style.setProperty('-ms-user-select', 'text', 'important');
+    }
+
+    if (element.shadowRoot) {
+      unlockRoot(element.shadowRoot);
+    }
+  };
+
+  const cleanTree = (root = document) => {
+    if (!root.querySelectorAll) return;
+
+    root.querySelectorAll(SELECTOR).forEach(cleanElement);
+    root.querySelectorAll('*').forEach((element) => {
+      if (element.shadowRoot) unlockRoot(element.shadowRoot);
+    });
+  };
+
+  const allowUserAction = (event) => {
+    const key = event.key?.toLowerCase();
+    const isUsefulShortcut =
+      event.type === 'keydown' &&
+      (event.ctrlKey || event.metaKey) &&
+      ['a', 'c', 'x', 'v', 's', 'p'].includes(key);
+
+    const isSelectionEvent = ['selectstart', 'selectionchange', 'copy', 'cut', 'paste', 'contextmenu', 'dragstart'].includes(event.type);
+
+    if (!isUsefulShortcut && !isSelectionEvent) return;
+
+    event.stopImmediatePropagation();
+  };
+
+  const installEventGuards = (root = document) => {
+    if (!root || root[HOST_ATTR]) return;
+
+    BLOCKED_EVENTS.forEach((eventName) => {
+      root.addEventListener(eventName, allowUserAction, true);
+    });
+
+    Object.defineProperty(root, HOST_ATTR, {
+      value: true,
+      configurable: false,
+    });
+  };
+
+  const observe = (root = document) => {
+    const target = root.documentElement || root.body || root;
+    if (!target || target.forceSelectPlusObserver) return;
+
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof Element) {
+            cleanElement(node);
+            cleanTree(node);
+          }
+        });
+
+        if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+          cleanElement(mutation.target);
+        }
+      }
+    });
+
+    observer.observe(target, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class', 'unselectable', 'onselectstart', 'oncopy', 'oncontextmenu', 'ondragstart'],
+    });
+
+    Object.defineProperty(target, 'forceSelectPlusObserver', {
+      value: observer,
+      configurable: true,
+    });
+  };
+
+  const unlockRoot = (root = document) => {
+    ensureStyle(root);
+    installEventGuards(root);
+    cleanTree(root);
+    observe(root);
+  };
+
+  const showToast = () => {
+    if (!document.body || document.getElementById('force-select-plus-toast')) return;
+
+    const toast = document.createElement('div');
+    toast.id = 'force-select-plus-toast';
+    toast.textContent = `${SCRIPT_NAME} enabled`;
+    toast.style.cssText = `
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 2147483647;
+      padding: 10px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.88);
+      color: #f8fafc;
+      font: 600 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      box-shadow: 0 16px 45px rgba(15, 23, 42, 0.28);
+      backdrop-filter: blur(10px);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 180ms ease, transform 180ms ease;
+    `;
+
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+    });
+
+    clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(8px)';
+      window.setTimeout(() => toast.remove(), 220);
+    }, 1800);
+  };
+
+  const patchAttachShadow = () => {
+    if (!Element.prototype.attachShadow || Element.prototype.attachShadow.forceSelectPlusPatched) return;
+
+    const originalAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function patchedAttachShadow(init) {
+      const shadowRoot = originalAttachShadow.call(this, init);
+      unlockRoot(shadowRoot);
+      return shadowRoot;
+    };
+
+    Object.defineProperty(Element.prototype.attachShadow, 'forceSelectPlusPatched', {
+      value: true,
+      configurable: false,
+    });
+  };
+
+  ready(() => {
+    patchAttachShadow();
+    unlockRoot(document);
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', showToast, { once: true });
+    } else {
+      showToast();
+    }
+  });
 })();
