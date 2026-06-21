@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Force Select+
-// @version      2.1.0
-// @description  Absolute-mode text-selection unlocker: restores selection, right-click, clipboard events, drag, pointer actions, and optional auto-copy on hostile websites.
+// @version      2.2.0
+// @description  iOS-ready absolute-mode text-selection unlocker for selection, right-click, clipboard events, drag, touch, pointer actions, and optional auto-copy.
 // @author       You
 // @match        *://*/*
+// @include      http://*/*
+// @include      https://*/*
 // @run-at       document-start
 // @grant        none
 // @namespace    https://greasyfork.org/users/1189174
@@ -16,27 +18,53 @@
 
   const SCRIPT_NAME = 'Force Select+';
   const STYLE_ID = 'force-select-plus-style';
+  const TOAST_ID = 'force-select-plus-toast';
   const AUTO_COPY_STORAGE_KEY = 'forceSelectPlusAutoCopy';
+  const BOOT_RETRY_LIMIT = 40;
+  const BOOT_RETRY_INTERVAL = 250;
   const guardedRoots = new WeakSet();
   const observedRoots = new WeakSet();
   const protectedEvents = new WeakSet();
+  const originalPreventDefault = Event.prototype.preventDefault;
+  const originalAttachShadow = Element.prototype.attachShadow;
+  let bootRetries = 0;
+  let bootTimer;
+  let toastTimer;
+
   const BLOCKED_EVENTS = [
     'selectstart',
     'selectionchange',
+    'beforecopy',
     'copy',
+    'beforecut',
     'cut',
+    'beforepaste',
     'paste',
     'contextmenu',
     'dragstart',
     'mousedown',
     'mouseup',
-    'keydown',
-    'keyup',
     'pointerdown',
     'pointerup',
     'touchstart',
     'touchend',
+    'keydown',
+    'keyup',
   ];
+
+  const PROTECTED_EVENT_TYPES = [
+    'selectstart',
+    'selectionchange',
+    'beforecopy',
+    'copy',
+    'beforecut',
+    'cut',
+    'beforepaste',
+    'paste',
+    'contextmenu',
+    'dragstart',
+  ];
+
   const SELECTOR = [
     'html',
     'body',
@@ -44,9 +72,12 @@
     '[style*="-webkit-user-select"]',
     '[style*="-moz-user-select"]',
     '[style*="-ms-user-select"]',
+    '[style*="pointer-events"]',
     '[unselectable]',
     '[onselectstart]',
     '[oncopy]',
+    '[oncut]',
+    '[onpaste]',
     '[oncontextmenu]',
     '[ondragstart]',
   ].join(',');
@@ -55,8 +86,10 @@
     *, *::before, *::after,
     html, body, body *:not(input):not(textarea):not(select):not(option) {
       -webkit-touch-callout: default !important;
+      -webkit-tap-highlight-color: rgba(56, 189, 248, 0.18) !important;
       -webkit-user-drag: auto !important;
       -webkit-user-select: text !important;
+      -khtml-user-select: text !important;
       -moz-user-select: text !important;
       -ms-user-select: text !important;
       user-select: text !important;
@@ -64,11 +97,14 @@
       cursor: auto !important;
     }
 
-    input, textarea, select, option, [contenteditable=""], [contenteditable="true"] {
+    input, textarea, select, option, [contenteditable=""], [contenteditable="true"], [role="textbox"] {
+      -webkit-touch-callout: default !important;
       -webkit-user-select: text !important;
+      -khtml-user-select: text !important;
       -moz-user-select: text !important;
       -ms-user-select: text !important;
       user-select: text !important;
+      pointer-events: auto !important;
     }
 
     ::selection {
@@ -78,38 +114,49 @@
     }
   `;
 
-  const originalPreventDefault = Event.prototype.preventDefault;
-  let toastTimer;
+  const isElement = (node) => Boolean(node && node.nodeType === Node.ELEMENT_NODE);
 
-  const ready = (callback) => {
-    if (document.documentElement) {
-      callback();
-      return;
-    }
+  const getExistingStyle = (root) => {
+    if (!root) return null;
+    if (typeof root.getElementById === 'function') return root.getElementById(STYLE_ID);
+    if (typeof root.querySelector === 'function') return root.querySelector(`#${STYLE_ID}`);
+    return null;
+  };
 
-    document.addEventListener('readystatechange', callback, { once: true, capture: true });
+  const getStyleTarget = (root) => {
+    if (root === document) return document.head || document.documentElement || document.body;
+    return root.head || root.documentElement || root;
   };
 
   const ensureStyle = (root = document) => {
-    if (!root || root.getElementById?.(STYLE_ID)) return;
+    const target = getStyleTarget(root);
+    if (!target) return;
 
     const ownerDocument = root.ownerDocument || document;
-    const style = ownerDocument.createElement('style');
-    style.id = STYLE_ID;
-    style.textContent = CSS;
+    let style = getExistingStyle(root);
 
-    const target = root.head || root.documentElement || root;
-    target.appendChild(style);
+    if (!style) {
+      style = ownerDocument.createElement('style');
+      style.id = STYLE_ID;
+      style.type = 'text/css';
+      style.textContent = CSS;
+    } else if (style.textContent !== CSS) {
+      style.textContent = CSS;
+    }
 
+    if (style.parentNode !== target && typeof target.appendChild === 'function') {
+      target.appendChild(style);
+    }
   };
 
   const cleanElement = (element) => {
-    if (!(element instanceof Element)) return;
+    if (!isElement(element)) return;
 
     element.removeAttribute('unselectable');
     element.removeAttribute('onselectstart');
     element.removeAttribute('oncopy');
     element.removeAttribute('oncut');
+    element.removeAttribute('onpaste');
     element.removeAttribute('oncontextmenu');
     element.removeAttribute('ondragstart');
 
@@ -117,17 +164,18 @@
     if (style) {
       style.setProperty('user-select', 'text', 'important');
       style.setProperty('-webkit-user-select', 'text', 'important');
+      style.setProperty('-khtml-user-select', 'text', 'important');
       style.setProperty('-moz-user-select', 'text', 'important');
       style.setProperty('-ms-user-select', 'text', 'important');
+      style.setProperty('pointer-events', 'auto', 'important');
+      style.setProperty('-webkit-touch-callout', 'default', 'important');
     }
 
-    if (element.shadowRoot) {
-      unlockRoot(element.shadowRoot);
-    }
+    if (element.shadowRoot) unlockRoot(element.shadowRoot);
   };
 
   const cleanTree = (root = document) => {
-    if (!root.querySelectorAll) return;
+    if (!root || typeof root.querySelectorAll !== 'function') return;
 
     root.querySelectorAll(SELECTOR).forEach(cleanElement);
     root.querySelectorAll('*').forEach((element) => {
@@ -135,27 +183,36 @@
     });
   };
 
+  const isEditableTarget = (target) => {
+    if (!isElement(target)) return false;
+    const tagName = target.tagName ? target.tagName.toLowerCase() : '';
+    return target.isContentEditable || ['input', 'textarea', 'select', 'option'].includes(tagName) || target.getAttribute('role') === 'textbox';
+  };
+
   const shouldProtectEvent = (event) => {
-    const key = event.key?.toLowerCase();
+    if (!event || !event.type) return false;
+
+    const key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
     const isUsefulShortcut =
       event.type === 'keydown' &&
       (event.ctrlKey || event.metaKey) &&
       ['a', 'c', 'x', 'v', 's', 'p'].includes(key);
 
-    const isSelectionEvent = ['selectstart', 'selectionchange', 'copy', 'cut', 'paste', 'contextmenu', 'dragstart'].includes(event.type);
-
-    return isUsefulShortcut || isSelectionEvent;
+    return isUsefulShortcut || PROTECTED_EVENT_TYPES.includes(event.type);
   };
 
   const allowUserAction = (event) => {
     if (!shouldProtectEvent(event)) return;
 
     protectedEvents.add(event);
-    event.stopImmediatePropagation();
+
+    if (!isEditableTarget(event.target) || event.type !== 'paste') {
+      event.stopImmediatePropagation();
+    }
   };
 
   const installEventGuards = (root = document) => {
-    if (!root || guardedRoots.has(root)) return;
+    if (!root || guardedRoots.has(root) || typeof root.addEventListener !== 'function') return;
 
     BLOCKED_EVENTS.forEach((eventName) => {
       root.addEventListener(eventName, allowUserAction, { capture: true, passive: false });
@@ -165,29 +222,31 @@
   };
 
   const observe = (root = document) => {
+    if (!root || typeof MutationObserver === 'undefined') return;
+
     const target = root.documentElement || root.body || root;
-    if (!target || observedRoots.has(target)) return;
+    if (!target || observedRoots.has(target) || typeof target.nodeType !== 'number') return;
 
     const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
+      mutations.forEach((mutation) => {
         mutation.addedNodes.forEach((node) => {
-          if (node instanceof Element) {
+          if (isElement(node)) {
             cleanElement(node);
             cleanTree(node);
           }
         });
 
-        if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+        if (mutation.type === 'attributes' && isElement(mutation.target)) {
           cleanElement(mutation.target);
         }
-      }
+      });
     });
 
     observer.observe(target, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class', 'unselectable', 'onselectstart', 'oncopy', 'oncontextmenu', 'ondragstart'],
+      attributeFilter: ['style', 'class', 'unselectable', 'onselectstart', 'oncopy', 'oncut', 'onpaste', 'oncontextmenu', 'ondragstart'],
     });
 
     observedRoots.add(target);
@@ -221,7 +280,7 @@
   const getAutoCopySetting = () => {
     try {
       return localStorage.getItem(AUTO_COPY_STORAGE_KEY) === 'true';
-    } catch {
+    } catch (error) {
       return false;
     }
   };
@@ -230,39 +289,61 @@
     try {
       localStorage.setItem(AUTO_COPY_STORAGE_KEY, String(Boolean(enabled)));
       showToast(`Auto-copy ${enabled ? 'enabled' : 'disabled'}`);
-    } catch {
+    } catch (error) {
       showToast('Auto-copy unavailable');
     }
   };
 
-  const autoCopySelection = async () => {
-    if (!getAutoCopySetting() || !navigator.clipboard?.writeText) return;
+  const writeClipboard = async (text) => {
+    if (!text) return false;
 
-    const selectedText = window.getSelection?.().toString().trim();
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    return copied;
+  };
+
+  const autoCopySelection = async () => {
+    if (!getAutoCopySetting()) return;
+
+    const selection = window.getSelection && window.getSelection();
+    const selectedText = selection ? selection.toString().trim() : '';
     if (!selectedText) return;
 
-    await navigator.clipboard.writeText(selectedText);
-    showToast('Selection copied');
+    const copied = await writeClipboard(selectedText);
+    if (copied) showToast('Selection copied');
   };
 
   const installAutoCopy = () => {
-    window.addEventListener('mouseup', () => {
-      window.setTimeout(() => {
-        autoCopySelection().catch(() => undefined);
-      }, 0);
-    }, { capture: true, passive: true });
+    if (guardedRoots.has(installAutoCopy)) return;
+
+    window.addEventListener('mouseup', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    window.addEventListener('touchend', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    guardedRoots.add(installAutoCopy);
   };
 
   const showToast = (message = `${SCRIPT_NAME} enabled`) => {
-    if (!document.body || document.getElementById('force-select-plus-toast')) return;
+    const body = document.body || document.documentElement;
+    if (!body || document.getElementById(TOAST_ID)) return;
 
     const toast = document.createElement('div');
-    toast.id = 'force-select-plus-toast';
+    toast.id = TOAST_ID;
     toast.textContent = message;
     toast.style.cssText = `
       position: fixed;
-      right: 16px;
-      bottom: 16px;
+      right: max(16px, env(safe-area-inset-right));
+      bottom: max(16px, env(safe-area-inset-bottom));
       z-index: 2147483647;
       padding: 10px 14px;
       border: 1px solid rgba(148, 163, 184, 0.35);
@@ -271,6 +352,7 @@
       color: #f8fafc;
       font: 600 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       box-shadow: 0 16px 45px rgba(15, 23, 42, 0.28);
+      -webkit-backdrop-filter: blur(10px);
       backdrop-filter: blur(10px);
       pointer-events: none;
       opacity: 0;
@@ -278,7 +360,7 @@
       transition: opacity 180ms ease, transform 180ms ease;
     `;
 
-    document.body.appendChild(toast);
+    body.appendChild(toast);
     requestAnimationFrame(() => {
       toast.style.opacity = '1';
       toast.style.transform = 'translateY(0)';
@@ -298,13 +380,13 @@
       disableAutoCopy: () => setAutoCopySetting(false),
       isAutoCopyEnabled: getAutoCopySetting,
       unlock: () => unlockRoot(document),
+      version: '2.2.0',
     });
   };
 
   const patchAttachShadow = () => {
-    if (!Element.prototype.attachShadow || Element.prototype.attachShadow.forceSelectPlusPatched) return;
+    if (!originalAttachShadow || Element.prototype.attachShadow.forceSelectPlusPatched) return;
 
-    const originalAttachShadow = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function patchedAttachShadow(init) {
       const shadowRoot = originalAttachShadow.call(this, init);
       unlockRoot(shadowRoot);
@@ -317,18 +399,40 @@
     });
   };
 
-  ready(() => {
+  const boot = () => {
     patchPreventDefault();
     patchAttachShadow();
     installEventGuards(window);
+    installEventGuards(document);
     installAutoCopy();
     exposeUtilityApi();
     unlockRoot(document);
+  };
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', showToast, { once: true });
-    } else {
-      showToast();
-    }
-  });
+  const scheduleBootRetries = () => {
+    if (bootTimer) return;
+
+    bootTimer = window.setInterval(() => {
+      boot();
+      bootRetries += 1;
+
+      if (bootRetries >= BOOT_RETRY_LIMIT || document.readyState === 'complete') {
+        window.clearInterval(bootTimer);
+        bootTimer = null;
+      }
+    }, BOOT_RETRY_INTERVAL);
+  };
+
+  boot();
+  scheduleBootRetries();
+
+  document.addEventListener('DOMContentLoaded', () => {
+    boot();
+    showToast();
+  }, { once: true, capture: true });
+
+  window.addEventListener('load', boot, { once: true, capture: true });
+  window.addEventListener('pageshow', boot, { capture: true });
+  document.addEventListener('visibilitychange', boot, { capture: true });
+  window.addEventListener('focus', boot, { capture: true });
 })();
