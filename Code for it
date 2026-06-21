@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Force Select+
-// @version      2.2.0
-// @description  iOS-ready absolute-mode text-selection unlocker for selection, right-click, clipboard events, drag, touch, pointer actions, and optional auto-copy.
+// @version      2.3.0
+// @description  Force Select+ Command Center: iOS-ready selection unlocker with copy tools, reader extraction, overlay nuking, and per-site controls.
 // @author       You
 // @match        *://*/*
 // @include      http://*/*
@@ -19,7 +19,11 @@
   const SCRIPT_NAME = 'Force Select+';
   const STYLE_ID = 'force-select-plus-style';
   const TOAST_ID = 'force-select-plus-toast';
+  const COMMAND_BUTTON_ID = 'force-select-plus-command-button';
+  const COMMAND_PANEL_ID = 'force-select-plus-command-panel';
   const AUTO_COPY_STORAGE_KEY = 'forceSelectPlusAutoCopy';
+  const TOASTS_ENABLED_KEY = 'forceSelectPlusToastsEnabled';
+  const DISABLED_SITES_KEY = 'forceSelectPlusDisabledSites';
   const BOOT_RETRY_LIMIT = 40;
   const BOOT_RETRY_INTERVAL = 250;
   const guardedRoots = new WeakSet();
@@ -30,6 +34,7 @@
   let bootRetries = 0;
   let bootTimer;
   let toastTimer;
+  let runtimeDisabled = false;
 
   const BLOCKED_EVENTS = [
     'selectstart',
@@ -116,6 +121,30 @@
 
   const isElement = (node) => Boolean(node && node.nodeType === Node.ELEMENT_NODE);
 
+  const getDisabledSites = () => {
+    try {
+      const value = JSON.parse(localStorage.getItem(DISABLED_SITES_KEY) || '[]');
+      return Array.isArray(value) ? value : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const setDisabledSites = (sites) => {
+    try {
+      localStorage.setItem(DISABLED_SITES_KEY, JSON.stringify(Array.from(new Set(sites)).sort()));
+    } catch (error) {
+      // Ignore storage failures; temporary disable still works.
+    }
+  };
+
+  const isSiteDisabled = () => getDisabledSites().includes(location.hostname);
+  const isDisabled = () => runtimeDisabled || isSiteDisabled();
+
+  const removeInjectedStyles = () => {
+    document.querySelectorAll(`#${STYLE_ID}`).forEach((style) => style.remove());
+  };
+
   const getExistingStyle = (root) => {
     if (!root) return null;
     if (typeof root.getElementById === 'function') return root.getElementById(STYLE_ID);
@@ -129,6 +158,8 @@
   };
 
   const ensureStyle = (root = document) => {
+    if (isDisabled()) return;
+
     const target = getStyleTarget(root);
     if (!target) return;
 
@@ -150,7 +181,7 @@
   };
 
   const cleanElement = (element) => {
-    if (!isElement(element)) return;
+    if (isDisabled() || !isElement(element)) return;
 
     element.removeAttribute('unselectable');
     element.removeAttribute('onselectstart');
@@ -175,7 +206,7 @@
   };
 
   const cleanTree = (root = document) => {
-    if (!root || typeof root.querySelectorAll !== 'function') return;
+    if (isDisabled() || !root || typeof root.querySelectorAll !== 'function') return;
 
     root.querySelectorAll(SELECTOR).forEach(cleanElement);
     root.querySelectorAll('*').forEach((element) => {
@@ -196,13 +227,13 @@
     const isUsefulShortcut =
       event.type === 'keydown' &&
       (event.ctrlKey || event.metaKey) &&
-      ['a', 'c', 'x', 'v', 's', 'p'].includes(key);
+      ['a', 'c', 'x', 'v', 's', 'p', 'f'].includes(key);
 
     return isUsefulShortcut || PROTECTED_EVENT_TYPES.includes(event.type);
   };
 
   const allowUserAction = (event) => {
-    if (!shouldProtectEvent(event)) return;
+    if (isDisabled() || !shouldProtectEvent(event)) return;
 
     protectedEvents.add(event);
 
@@ -222,7 +253,7 @@
   };
 
   const observe = (root = document) => {
-    if (!root || typeof MutationObserver === 'undefined') return;
+    if (isDisabled() || !root || typeof MutationObserver === 'undefined') return;
 
     const target = root.documentElement || root.body || root;
     if (!target || observedRoots.has(target) || typeof target.nodeType !== 'number') return;
@@ -263,7 +294,7 @@
     if (Event.prototype.preventDefault.forceSelectPlusPatched) return;
 
     Event.prototype.preventDefault = function forceSelectPlusPreventDefault() {
-      if (protectedEvents.has(this) || shouldProtectEvent(this)) {
+      if (!isDisabled() && (protectedEvents.has(this) || shouldProtectEvent(this))) {
         protectedEvents.add(this);
         return undefined;
       }
@@ -285,55 +316,17 @@
     }
   };
 
-  const setAutoCopySetting = (enabled) => {
+  const areToastsEnabled = () => {
     try {
-      localStorage.setItem(AUTO_COPY_STORAGE_KEY, String(Boolean(enabled)));
-      showToast(`Auto-copy ${enabled ? 'enabled' : 'disabled'}`);
+      return localStorage.getItem(TOASTS_ENABLED_KEY) !== 'false';
     } catch (error) {
-      showToast('Auto-copy unavailable');
-    }
-  };
-
-  const writeClipboard = async (text) => {
-    if (!text) return false;
-
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      await navigator.clipboard.writeText(text);
       return true;
     }
-
-    const textarea = document.createElement('textarea');
-    textarea.value = text;
-    textarea.setAttribute('readonly', 'readonly');
-    textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
-    document.body.appendChild(textarea);
-    textarea.select();
-    textarea.setSelectionRange(0, textarea.value.length);
-    const copied = document.execCommand('copy');
-    textarea.remove();
-    return copied;
   };
 
-  const autoCopySelection = async () => {
-    if (!getAutoCopySetting()) return;
+  const showToast = (message = `${SCRIPT_NAME} enabled`, options = {}) => {
+    if (!options.force && !areToastsEnabled()) return;
 
-    const selection = window.getSelection && window.getSelection();
-    const selectedText = selection ? selection.toString().trim() : '';
-    if (!selectedText) return;
-
-    const copied = await writeClipboard(selectedText);
-    if (copied) showToast('Selection copied');
-  };
-
-  const installAutoCopy = () => {
-    if (guardedRoots.has(installAutoCopy)) return;
-
-    window.addEventListener('mouseup', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
-    window.addEventListener('touchend', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
-    guardedRoots.add(installAutoCopy);
-  };
-
-  const showToast = (message = `${SCRIPT_NAME} enabled`) => {
     const body = document.body || document.documentElement;
     if (!body || document.getElementById(TOAST_ID)) return;
 
@@ -374,13 +367,299 @@
     }, 1800);
   };
 
+  const updateCommandCenter = () => {
+    const panel = document.getElementById(COMMAND_PANEL_ID);
+    if (!panel) return;
+
+    panel.querySelector('[data-fsp-status]').textContent = isDisabled() ? 'Paused on this page' : 'Active';
+    panel.querySelector('[data-fsp-autocopy]').textContent = `Auto-Copy ${getAutoCopySetting() ? 'On' : 'Off'}`;
+    panel.querySelector('[data-fsp-toasts]').textContent = `${areToastsEnabled() ? 'Hide' : 'Show'} Toasts`;
+    panel.querySelector('[data-fsp-temp]').textContent = runtimeDisabled ? 'Resume This Tab' : 'Pause This Tab';
+    panel.querySelector('[data-fsp-site]').textContent = isSiteDisabled() ? 'Enable On This Site' : 'Disable On This Site';
+  };
+
+  const setAutoCopySetting = (enabled) => {
+    try {
+      localStorage.setItem(AUTO_COPY_STORAGE_KEY, String(Boolean(enabled)));
+      updateCommandCenter();
+      showToast(`Auto-copy ${enabled ? 'enabled' : 'disabled'}`);
+    } catch (error) {
+      showToast('Auto-copy unavailable', { force: true });
+    }
+  };
+
+  const setToastsEnabled = (enabled) => {
+    try {
+      localStorage.setItem(TOASTS_ENABLED_KEY, String(Boolean(enabled)));
+    } catch (error) {
+      // Ignore storage failures; the in-page state still updates visually.
+    }
+
+    updateCommandCenter();
+    showToast(`Toasts ${enabled ? 'shown' : 'hidden'}`, { force: true });
+  };
+
+  const setSiteDisabled = (disabled) => {
+    const sites = getDisabledSites().filter((site) => site !== location.hostname);
+    if (disabled) sites.push(location.hostname);
+    setDisabledSites(sites);
+    runtimeDisabled = false;
+    removeInjectedStyles();
+    updateCommandCenter();
+    showToast(disabled ? 'Disabled on this site' : 'Enabled on this site', { force: true });
+    if (!disabled) boot();
+  };
+
+  const writeClipboard = async (text) => {
+    if (!text) return false;
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    return copied;
+  };
+
+  const copySelectionNow = async () => {
+    const selection = window.getSelection && window.getSelection();
+    const text = selection ? selection.toString().trim() : '';
+    if (!text) {
+      showToast('No text selected', { force: true });
+      return false;
+    }
+
+    const copied = await writeClipboard(text);
+    showToast(copied ? 'Selected text copied' : 'Copy failed', { force: true });
+    return copied;
+  };
+
+  const autoCopySelection = async () => {
+    if (!getAutoCopySetting()) return;
+
+    const selection = window.getSelection && window.getSelection();
+    const selectedText = selection ? selection.toString().trim() : '';
+    if (!selectedText) return;
+
+    const copied = await writeClipboard(selectedText);
+    if (copied) showToast('Selection copied');
+  };
+
+  const extractReadableText = async () => {
+    const elements = Array.from(document.querySelectorAll('article, main, p, h1, h2, h3, li'));
+    const text = elements
+      .map((element) => (element.innerText || element.textContent || '').trim())
+      .filter(Boolean)
+      .join('\n\n');
+
+    if (!text) {
+      showToast('No readable text found', { force: true });
+      return false;
+    }
+
+    const copied = await writeClipboard(text);
+    showToast(copied ? 'Page text copied' : 'Copy failed', { force: true });
+    return copied;
+  };
+
+  const removeBlockingOverlays = () => {
+    Array.from(document.querySelectorAll('*')).forEach((element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const zIndex = Number.parseInt(style.zIndex, 10);
+
+      if (style.position === 'fixed' && rect.width > window.innerWidth * 0.8 && rect.height > window.innerHeight * 0.8 && zIndex > 1000) {
+        element.style.setProperty('pointer-events', 'none', 'important');
+      }
+    });
+
+    showToast('Overlays softened', { force: true });
+  };
+
+  const copyImageTextHints = async () => {
+    const text = Array.from(document.images)
+      .map((image) => [image.alt, image.title, image.getAttribute('aria-label')].filter(Boolean).join(' — '))
+      .filter(Boolean)
+      .join('\n');
+
+    if (!text) {
+      showToast('No image text found', { force: true });
+      return false;
+    }
+
+    const copied = await writeClipboard(text);
+    showToast(copied ? 'Image text copied' : 'Copy failed', { force: true });
+    return copied;
+  };
+
+  const installAutoCopy = () => {
+    if (guardedRoots.has(installAutoCopy)) return;
+
+    window.addEventListener('mouseup', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    window.addEventListener('touchend', () => window.setTimeout(() => autoCopySelection().catch(() => undefined), 0), { capture: true, passive: true });
+    guardedRoots.add(installAutoCopy);
+  };
+
+  const createButton = (label, onClick, variant = 'default') => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.style.cssText = `
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: ${variant === 'danger' ? 'rgba(239, 68, 68, 0.16)' : 'rgba(56, 189, 248, 0.14)'};
+      color: ${variant === 'danger' ? '#fecaca' : '#e0f2fe'};
+      font: 700 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      text-align: left;
+      pointer-events: auto !important;
+      -webkit-user-select: none !important;
+      user-select: none !important;
+    `;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      Promise.resolve(onClick()).catch(() => showToast('Command failed', { force: true }));
+    });
+    return button;
+  };
+
+  const createCommandCenter = () => {
+    const body = document.body || document.documentElement;
+    if (!body || document.getElementById(COMMAND_BUTTON_ID)) return;
+
+    const button = document.createElement('button');
+    button.id = COMMAND_BUTTON_ID;
+    button.type = 'button';
+    button.textContent = 'FS+';
+    button.setAttribute('aria-label', 'Force Select+ Command Center');
+    button.style.cssText = `
+      position: fixed;
+      right: max(14px, env(safe-area-inset-right));
+      top: calc(max(14px, env(safe-area-inset-top)) + 72px);
+      z-index: 2147483647;
+      width: 52px;
+      height: 52px;
+      border: 1px solid rgba(125, 211, 252, 0.5);
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(14, 165, 233, 0.96), rgba(99, 102, 241, 0.96));
+      color: white;
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.34);
+      font: 900 14px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: -0.03em;
+      pointer-events: auto !important;
+      -webkit-user-select: none !important;
+      user-select: none !important;
+    `;
+
+    const panel = document.createElement('div');
+    panel.id = COMMAND_PANEL_ID;
+    panel.hidden = true;
+    panel.style.cssText = `
+      position: fixed;
+      right: max(14px, env(safe-area-inset-right));
+      top: calc(max(14px, env(safe-area-inset-top)) + 132px);
+      z-index: 2147483647;
+      width: min(280px, calc(100vw - 28px));
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 20px;
+      background: rgba(15, 23, 42, 0.94);
+      color: #f8fafc;
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.42);
+      -webkit-backdrop-filter: blur(14px);
+      backdrop-filter: blur(14px);
+      pointer-events: auto !important;
+      -webkit-user-select: none !important;
+      user-select: none !important;
+    `;
+
+    const title = document.createElement('div');
+    title.innerHTML = '<strong>Force Select+ Command Center</strong><span data-fsp-status style="display:block;margin-top:3px;color:#bae6fd;font:700 12px/1.2 system-ui;">Active</span>';
+    title.style.cssText = 'font: 800 14px/1.25 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 2px 2px 6px;';
+    panel.appendChild(title);
+
+    panel.appendChild(createButton('Unlock Page', () => {
+      runtimeDisabled = false;
+      boot();
+      showToast('Page unlocked', { force: true });
+    }));
+    panel.appendChild(createButton('Copy Selection', copySelectionNow));
+    panel.appendChild(createButton('Copy Article Text', extractReadableText));
+    panel.appendChild(createButton('Copy Image Text', copyImageTextHints));
+    panel.appendChild(createButton('Nuke Overlays', removeBlockingOverlays));
+
+    const autoCopyButton = createButton('Auto-Copy Off', () => setAutoCopySetting(!getAutoCopySetting()));
+    autoCopyButton.setAttribute('data-fsp-autocopy', '');
+    panel.appendChild(autoCopyButton);
+
+    const toastButton = createButton('Hide Toasts', () => setToastsEnabled(!areToastsEnabled()));
+    toastButton.setAttribute('data-fsp-toasts', '');
+    panel.appendChild(toastButton);
+
+    const tempButton = createButton('Pause This Tab', () => {
+      runtimeDisabled = !runtimeDisabled;
+      if (runtimeDisabled) removeInjectedStyles();
+      updateCommandCenter();
+      showToast(runtimeDisabled ? 'Paused in this tab' : 'Resumed in this tab', { force: true });
+      if (!runtimeDisabled) boot();
+    }, 'danger');
+    tempButton.setAttribute('data-fsp-temp', '');
+    panel.appendChild(tempButton);
+
+    const siteButton = createButton('Disable On This Site', () => setSiteDisabled(!isSiteDisabled()), 'danger');
+    siteButton.setAttribute('data-fsp-site', '');
+    panel.appendChild(siteButton);
+
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      panel.hidden = !panel.hidden;
+      updateCommandCenter();
+    });
+
+    body.appendChild(button);
+    body.appendChild(panel);
+    updateCommandCenter();
+  };
+
   const exposeUtilityApi = () => {
     window.ForceSelectPlus = Object.freeze({
       enableAutoCopy: () => setAutoCopySetting(true),
       disableAutoCopy: () => setAutoCopySetting(false),
       isAutoCopyEnabled: getAutoCopySetting,
+      copySelection: () => copySelectionNow(),
+      copyArticleText: () => extractReadableText(),
+      copyImageText: () => copyImageTextHints(),
+      nukeOverlays: () => removeBlockingOverlays(),
+      hideToasts: () => setToastsEnabled(false),
+      showToasts: () => setToastsEnabled(true),
+      pause: () => {
+        runtimeDisabled = true;
+        removeInjectedStyles();
+        updateCommandCenter();
+      },
+      resume: () => {
+        runtimeDisabled = false;
+        boot();
+        updateCommandCenter();
+      },
+      disableSite: () => setSiteDisabled(true),
+      enableSite: () => setSiteDisabled(false),
       unlock: () => unlockRoot(document),
-      version: '2.2.0',
+      version: '2.3.0',
     });
   };
 
@@ -406,7 +685,16 @@
     installEventGuards(document);
     installAutoCopy();
     exposeUtilityApi();
+    createCommandCenter();
+
+    if (isDisabled()) {
+      removeInjectedStyles();
+      updateCommandCenter();
+      return;
+    }
+
     unlockRoot(document);
+    updateCommandCenter();
   };
 
   const scheduleBootRetries = () => {
